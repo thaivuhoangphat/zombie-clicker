@@ -24,3 +24,4 @@ After the first successful run, visit:
 https://<your-username>.github.io/zombie-clicker/
 ```
 (replace `<your-username>` with your GitHub username).
+"# zombie-clicker" 
