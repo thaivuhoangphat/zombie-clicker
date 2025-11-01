@@ -1,0 +1,11 @@
+# Basic Coderabbit repo config (optional)
+reviews:
+  high_level_summary: true
+  changed_files_summary: true
+  request_changes_workflow: true
+  review_status: true
+  commit_status: true
+  fail_commit_status: false
+chat:
+  enable_mentions: true
+  auto_reply: true

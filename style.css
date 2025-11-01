@@ -1,0 +1,19 @@
+* { box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  margin: 0; padding: 0; display: grid; min-height: 100vh;
+  grid-template-rows: auto 1fr auto; background: #f6f8fa;
+}
+header, footer { padding: 16px 20px; background: #111827; color: #fff; }
+main { padding: 16px 20px; display: grid; gap: 12px; justify-items: start; }
+#gameCanvas {
+  background: radial-gradient(circle at 30% 30%, #e5f7ff, #c7e1ff);
+  border: 2px solid #1f2937; border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.15);
+}
+#hud { display: flex; align-items: center; gap: 12px; }
+#score { font-weight: 700; font-size: 18px; }
+#resetBtn {
+  padding: 8px 14px; border-radius: 8px; border: 1px solid #1f2937; background: #10b981; color: #fff;
+  cursor: pointer;
+}
+#resetBtn:hover { filter: brightness(0.95); }
