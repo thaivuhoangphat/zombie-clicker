@@ -1,0 +1,622 @@
+' ============================================================================
+'  iLogic Rule: ExportSheetMetalAssembly
+'  Mục đích : Tự động xuất bản vẽ cho file lắp ráp (.iam) dạng tấm thép
+'             - Sheet 1 : Bản vẽ tổng (4 hình chiếu + iso + BOM + title)
+'             - Sheet 2+: Bản vẽ chi tiết từng tấm (folded + flat pattern + BOM)
+'             - Xuất .idw  và .pdf cùng thư mục với file lắp ráp
+'  Áp dụng  : Autodesk Inventor Professional 2026 (vẫn chạy được trên 2022+)
+'  Tác giả  : Captain Capy  -  capy.ai
+' ============================================================================
+'  CÁCH DÙNG
+'  1.  Tools  >  iLogic  >  Open iLogic Browser
+'  2.  Tab "External Rules"  >  click +  >  chọn file này, save .iLogicVb
+'  3.  Mở file .iam của tủ (các part bên trong phải là Sheet Metal)
+'  4.  Trong iLogic Browser  >  right-click rule  >  Run Rule
+'  Toàn bộ tham số chỉnh ở mục CẤU HÌNH ngay dưới đây.
+' ============================================================================
+
+AddReference "System.Windows.Forms"
+Imports System.Windows.Forms
+Imports System.IO
+Imports System.Collections.Generic
+Imports System.Diagnostics
+
+' ========================  CẤU HÌNH NGƯỜI DÙNG  ============================
+Dim cfgProjectName    As String  = "CN LINK"              ' Tên dự án
+Dim cfgRAL            As String  = "7035"                 ' Mã sơn
+Dim cfgQuantity       As String  = "02"                   ' Số lượng tủ
+Dim cfgDesigner       As String  = "Admin"                ' Người thiết kế
+Dim cfgDefaultMaterial As String = "T.DEN 1.2"            ' Vật liệu mặc định ghi BOM
+
+Dim cfgAssemblyScale  As Double  = 1.0 / 5.0              ' Tỉ lệ bản vẽ lắp (1:5)
+Dim cfgPartScale      As Double  = 1.0 / 5.0              ' Tỉ lệ bản vẽ chi tiết (1:5)
+Dim cfgDetailScale    As Double  = 1.5                    ' Tỉ lệ view detail bend (1.5:1)
+Dim cfgPartsPerSheet  As Integer = 4                      ' Mỗi sheet bao nhiêu part (2x2)
+
+Dim cfgSheetSize      As DrawingSheetSizeEnum = DrawingSheetSizeEnum.kA3DrawingSheetSize
+Dim cfgLandscape      As Boolean = True
+
+Dim cfgAddDetailViews As Boolean = True                   ' Tự động thêm view detail cho bend
+Dim cfgAddSectionFF   As Boolean = False                  ' True = tạo section F-F (cần định nghĩa thủ công)
+Dim cfgSavePDF        As Boolean = True
+Dim cfgSaveIDW        As Boolean = True
+Dim cfgOverwrite      As Boolean = True
+Dim cfgOutputFolder   As String  = ""                     ' "" => cùng folder file .iam
+Dim cfgTemplatePath   As String  = ""                     ' "" => dùng template Inventor mặc định
+' ============================================================================
+
+' ----------- STRUCT: Mỗi entry là 1 part duy nhất + số lượng ----------------
+Class PartEntry
+    Public PartDoc As PartDocument
+    Public PartNumber As String
+    Public Quantity As Integer
+    Public Material As String
+    Public IsSheetMetal As Boolean
+End Class
+
+' ============================================================================
+'                                  MAIN
+' ============================================================================
+Sub Main()
+    Dim oApp As Inventor.Application = ThisApplication
+    Dim oDoc As Document = oApp.ActiveDocument
+
+    If oDoc Is Nothing OrElse oDoc.DocumentType <> DocumentTypeEnum.kAssemblyDocumentObject Then
+        MessageBox.Show("Vui lòng mở file lắp ráp (.iam) trước khi chạy rule!", _
+                        "Cần file lắp ráp", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        Return
+    End If
+
+    Dim oAsm As AssemblyDocument = CType(oDoc, AssemblyDocument)
+    Dim asmName As String = Path.GetFileNameWithoutExtension(oAsm.FullFileName)
+    Dim asmFolder As String = Path.GetDirectoryName(oAsm.FullFileName)
+    Dim outFolder As String = If(String.IsNullOrEmpty(cfgOutputFolder), asmFolder, cfgOutputFolder)
+    If Not Directory.Exists(outFolder) Then Directory.CreateDirectory(outFolder)
+
+    Try
+        oApp.ScreenUpdating = False
+        oApp.UserInterfaceManager.UserInteractionDisabled = True
+
+        Logger.Info("=== Bắt đầu xuất bản vẽ: " & asmName & " ===")
+
+        ' 1) Đảm bảo mọi part sheet-metal đều có flat pattern
+        EnsureFlatPatterns(oAsm)
+
+        ' 2) Lấy danh sách part duy nhất + số lượng
+        Dim partList As List(Of PartEntry) = GetUniqueParts(oAsm)
+        Logger.Info("Tìm thấy " & partList.Count & " part duy nhất.")
+
+        ' 3) Set iProperties cho assembly (để title block tự động điền)
+        SetAssemblyIProperties(oAsm, asmName)
+
+        ' 4) Tạo drawing
+        Dim oDrawing As DrawingDocument = CreateDrawingDocument(oApp, asmName, outFolder)
+
+        ' 5) Sheet 1 - tổng thể
+        Dim totalSheets As Integer = 1 + CInt(Math.Ceiling(partList.Count / cfgPartsPerSheet))
+        BuildAssemblySheet(oDrawing, oAsm, partList, asmName, 1, totalSheets)
+
+        ' 6) Sheet 2+ - chi tiết
+        BuildPartSheets(oDrawing, partList, asmName, totalSheets)
+
+        ' 7) Lưu IDW
+        Dim idwPath As String = Path.Combine(outFolder, asmName & ".idw")
+        If File.Exists(idwPath) AndAlso cfgOverwrite Then File.Delete(idwPath)
+        oDrawing.SaveAs(idwPath, False)
+        Logger.Info("Đã lưu: " & idwPath)
+
+        ' 8) Xuất PDF
+        If cfgSavePDF Then
+            Dim pdfPath As String = Path.Combine(outFolder, asmName & ".pdf")
+            If File.Exists(pdfPath) AndAlso cfgOverwrite Then File.Delete(pdfPath)
+            ExportPDF(oDrawing, pdfPath)
+            Logger.Info("Đã xuất PDF: " & pdfPath)
+        End If
+
+        oApp.UserInterfaceManager.UserInteractionDisabled = False
+        oApp.ScreenUpdating = True
+
+        MessageBox.Show("Đã xuất xong bản vẽ:" & vbCrLf & vbCrLf & _
+                        "• IDW: " & idwPath & vbCrLf & _
+                        If(cfgSavePDF, "• PDF: " & Path.Combine(outFolder, asmName & ".pdf"), ""), _
+                        "Hoàn tất", MessageBoxButtons.OK, MessageBoxIcon.Information)
+
+    Catch ex As Exception
+        oApp.UserInterfaceManager.UserInteractionDisabled = False
+        oApp.ScreenUpdating = True
+        Logger.Error("LỖI: " & ex.Message)
+        MessageBox.Show("Có lỗi xảy ra:" & vbCrLf & vbCrLf & ex.Message & vbCrLf & vbCrLf & _
+                        "Chi tiết:" & vbCrLf & ex.StackTrace, _
+                        "Lỗi khi xuất bản vẽ", MessageBoxButtons.OK, MessageBoxIcon.Error)
+    End Try
+End Sub
+
+' ============================================================================
+'              ĐẢM BẢO MỌI PART SHEET METAL CÓ FLAT PATTERN
+' ============================================================================
+Sub EnsureFlatPatterns(oAsm As AssemblyDocument)
+    Dim seen As New HashSet(Of String)
+    For Each oOcc As ComponentOccurrence In oAsm.ComponentDefinition.Occurrences.AllLeafOccurrences
+        If oOcc.Suppressed Then Continue For
+        Dim refDoc As Document = TryCast(oOcc.Definition.Document, Document)
+        If refDoc Is Nothing Then Continue For
+        If refDoc.DocumentType <> DocumentTypeEnum.kPartDocumentObject Then Continue For
+
+        Dim pDoc As PartDocument = CType(refDoc, PartDocument)
+        If seen.Contains(pDoc.FullFileName) Then Continue For
+        seen.Add(pDoc.FullFileName)
+
+        If IsSheetMetalPart(pDoc) Then
+            Dim smDef As SheetMetalComponentDefinition = CType(pDoc.ComponentDefinition, SheetMetalComponentDefinition)
+            If Not smDef.HasFlatPattern Then
+                Try
+                    smDef.Unfold()
+                    smDef.FlatPattern.ExitEdit()
+                    pDoc.Save2(False)
+                    Logger.Info("  + Đã tạo flat pattern cho: " & Path.GetFileName(pDoc.FullFileName))
+                Catch ex As Exception
+                    Logger.Warn("  ! Không tạo được flat pattern: " & Path.GetFileName(pDoc.FullFileName) & " - " & ex.Message)
+                End Try
+            End If
+        End If
+    Next
+End Sub
+
+Function IsSheetMetalPart(pDoc As PartDocument) As Boolean
+    ' GUID của Sheet Metal Part subtype
+    Return pDoc.SubType = "{9C464203-9BAE-11D3-8BAD-0060B0CE6BB4}"
+End Function
+
+' ============================================================================
+'        LẤY DANH SÁCH PART DUY NHẤT + SỐ LƯỢNG (dùng iProp PartNumber)
+' ============================================================================
+Function GetUniqueParts(oAsm As AssemblyDocument) As List(Of PartEntry)
+    Dim dict As New Dictionary(Of String, PartEntry)
+
+    For Each oOcc As ComponentOccurrence In oAsm.ComponentDefinition.Occurrences.AllLeafOccurrences
+        If oOcc.Suppressed Then Continue For
+        Dim refDoc As Document = TryCast(oOcc.Definition.Document, Document)
+        If refDoc Is Nothing Then Continue For
+        If refDoc.DocumentType <> DocumentTypeEnum.kPartDocumentObject Then Continue For
+
+        Dim pDoc As PartDocument = CType(refDoc, PartDocument)
+        Dim key As String = GetPartNumber(pDoc)
+
+        If dict.ContainsKey(key) Then
+            dict(key).Quantity += 1
+        Else
+            Dim e As New PartEntry()
+            e.PartDoc      = pDoc
+            e.PartNumber   = key
+            e.Quantity     = 1
+            e.Material     = GetMaterialText(pDoc)
+            e.IsSheetMetal = IsSheetMetalPart(pDoc)
+            dict.Add(key, e)
+        End If
+    Next
+
+    Dim list As New List(Of PartEntry)(dict.Values)
+    list.Sort(Function(a, b) String.Compare(a.PartNumber, b.PartNumber))
+    Return list
+End Function
+
+Function GetPartNumber(pDoc As PartDocument) As String
+    Try
+        Dim pn As String = pDoc.PropertySets.Item("Design Tracking Properties").Item("Part Number").Value
+        If Not String.IsNullOrEmpty(pn) Then Return pn
+    Catch
+    End Try
+    Return Path.GetFileNameWithoutExtension(pDoc.FullFileName)
+End Function
+
+Function GetMaterialText(pDoc As PartDocument) As String
+    Try
+        Dim mat As String = pDoc.PropertySets.Item("Design Tracking Properties").Item("Material").Value
+        If Not String.IsNullOrEmpty(mat) Then Return mat
+    Catch
+    End Try
+    Return cfgDefaultMaterial
+End Function
+
+' ============================================================================
+'                      iPROPERTIES CHO TITLE BLOCK
+' ============================================================================
+Sub SetAssemblyIProperties(oAsm As AssemblyDocument, asmName As String)
+    Try
+        Dim dt As PropertySet = oAsm.PropertySets.Item("Design Tracking Properties")
+        SetProp(dt, "Designer", cfgDesigner)
+        SetProp(dt, "Project",  cfgProjectName)
+        SetProp(dt, "Stock Number", "RAL " & cfgRAL)
+        SetProp(dt, "Description", asmName)
+    Catch ex As Exception
+        Logger.Warn("Không set được iProperties: " & ex.Message)
+    End Try
+End Sub
+
+Sub SetProp(ps As PropertySet, name As String, value As Object)
+    Try
+        ps.Item(name).Value = value
+    Catch
+        Try
+            ps.Add(value, name)
+        Catch
+        End Try
+    End Try
+End Sub
+
+' ============================================================================
+'                          TẠO DRAWING DOCUMENT
+' ============================================================================
+Function CreateDrawingDocument(oApp As Inventor.Application, asmName As String, outFolder As String) As DrawingDocument
+    Dim oDrawing As DrawingDocument
+    Dim templatePath As String = cfgTemplatePath
+
+    If String.IsNullOrEmpty(templatePath) Then
+        templatePath = oApp.FileManager.GetTemplateFile( _
+            DocumentTypeEnum.kDrawingDocumentObject, _
+            SystemOfMeasureEnum.kMetricSystemOfMeasure, _
+            DraftingStandardEnum.kDefault_DraftingStandard, "")
+    End If
+
+    oDrawing = oApp.Documents.Add(DocumentTypeEnum.kDrawingDocumentObject, templatePath, True)
+    Return oDrawing
+End Function
+
+' ============================================================================
+'                       SHEET 1 - BẢN VẼ TỔNG THỂ
+' ============================================================================
+Sub BuildAssemblySheet(oDrawing As DrawingDocument, oAsm As AssemblyDocument, _
+                       partList As List(Of PartEntry), asmName As String, _
+                       sheetNum As Integer, totalSheets As Integer)
+    Dim oSheet As Sheet = oDrawing.Sheets.Item(1)
+    ConfigureSheet(oSheet, "Sheet:1", sheetNum, totalSheets)
+
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim w As Double = oSheet.Width    ' cm
+    Dim h As Double = oSheet.Height
+
+    ' === Vị trí (đơn vị cm) - layout A3 ngang =================================
+    '   ┌────────────┬──────────────────────────────────────┐
+    '   │   BOM      │     FRONT       RIGHT       BACK     │
+    '   │            │                                       │
+    '   ├────────────┼─── TOP ────────────────── SECTION ───┤
+    '   │   ISO      │                          F-F (1:5)    │
+    '   │            │                          INFO TEXT    │
+    '   └────────────┴──────────────────────────────────────┘
+    Dim cxFront As Double = w * 0.38
+    Dim cyFront As Double = h * 0.62
+    Dim dx As Double = 11        ' khoảng cách giữa các view (cm)
+    Dim dy As Double = 11
+
+    ' --- Front view ---
+    Dim oFront As DrawingView = oSheet.DrawingViews.AddBaseView( _
+        oAsm, oTG.CreatePoint2d(cxFront, cyFront), cfgAssemblyScale, _
+        ViewOrientationTypeEnum.kFrontViewOrientation, _
+        DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle)
+
+    ' --- Right view (chiếu sang phải) ---
+    Dim oRight As DrawingView = oSheet.DrawingViews.AddProjectedView( _
+        oFront, oTG.CreatePoint2d(cxFront + dx, cyFront), _
+        DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle)
+
+    ' --- Back view (chiếu tiếp sang phải từ Right) ---
+    Dim oBack As DrawingView = oSheet.DrawingViews.AddProjectedView( _
+        oRight, oTG.CreatePoint2d(cxFront + 2 * dx, cyFront), _
+        DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle)
+
+    ' --- Top view (chiếu xuống dưới từ Front) ---
+    Dim oTop As DrawingView = oSheet.DrawingViews.AddProjectedView( _
+        oFront, oTG.CreatePoint2d(cxFront, cyFront - dy), _
+        DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle)
+
+    ' --- Isometric view (góc trái dưới) ---
+    Dim oIso As DrawingView = oSheet.DrawingViews.AddBaseView( _
+        oAsm, oTG.CreatePoint2d(w * 0.15, h * 0.25), cfgAssemblyScale, _
+        ViewOrientationTypeEnum.kIsoTopRightViewOrientation, _
+        DrawingViewStyleEnum.kShadedDrawingViewStyle)
+
+    ' --- Section view F-F (nếu bật) ---
+    If cfgAddSectionFF Then
+        Try
+            Dim pts(1) As Point2d
+            pts(0) = oTG.CreatePoint2d(oFront.Position.X, oFront.Position.Y + oFront.Height / 2 + 1)
+            pts(1) = oTG.CreatePoint2d(oFront.Position.X, oFront.Position.Y - oFront.Height / 2 - 1)
+            Dim oSecLine As ObjectCollection = ThisApplication.TransientObjects.CreateObjectCollection
+            oSecLine.Add(pts(0)) : oSecLine.Add(pts(1))
+            Dim oSec As DrawingView = oSheet.DrawingViews.AddSectionView( _
+                oFront, oTG.CreatePoint2d(cxFront + 2 * dx, cyFront - dy), oSecLine, _
+                DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle, cfgAssemblyScale, _
+                "F", , True)
+        Catch ex As Exception
+            Logger.Warn("Bỏ qua section F-F: " & ex.Message)
+        End Try
+    End If
+
+    ' --- BOM (góc trên trái) ---
+    AddPartsList(oSheet, oFront, oTG.CreatePoint2d(w * 0.05, h * 0.92), partList)
+
+    ' --- Khung text thông tin dự án (góc dưới phải) ---
+    Dim infoText As String = _
+        "TU " & asmName.Replace("TU ", "").Trim() & vbCrLf & _
+        "DU AN: " & cfgProjectName & vbCrLf & _
+        "RAL: " & cfgRAL & vbCrLf & _
+        "SO LUONG: " & cfgQuantity
+    AddTextBox(oSheet, oTG.CreatePoint2d(w * 0.80, h * 0.18), infoText)
+End Sub
+
+' ============================================================================
+'                  SHEET 2+ - BẢN VẼ CHI TIẾT TỪNG PART
+' ============================================================================
+Sub BuildPartSheets(oDrawing As DrawingDocument, partList As List(Of PartEntry), _
+                    asmName As String, totalSheets As Integer)
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+
+    Dim sheetIndex As Integer = 2
+    Dim partIndex As Integer = 0
+
+    While partIndex < partList.Count
+        Dim oSheet As Sheet = oDrawing.Sheets.Add(cfgSheetSize)
+        ConfigureSheet(oSheet, "Sheet:" & sheetIndex, sheetIndex, totalSheets)
+
+        Dim w As Double = oSheet.Width
+        Dim h As Double = oSheet.Height
+
+        ' Chia khung sheet thành lưới (2x2 mặc định)
+        Dim rows As Integer = 2
+        Dim cols As Integer = CInt(Math.Ceiling(cfgPartsPerSheet / rows))
+
+        Dim cellW As Double = w / cols
+        Dim cellH As Double = h / rows
+
+        For r As Integer = 0 To rows - 1
+            For c As Integer = 0 To cols - 1
+                If partIndex >= partList.Count Then Exit For
+                Dim entry As PartEntry = partList(partIndex)
+
+                ' Tâm ô (r=0 = hàng trên)
+                Dim cx As Double = (c + 0.5) * cellW
+                Dim cy As Double = h - (r + 0.5) * cellH
+
+                Try
+                    AddPartGroup(oSheet, entry, cx, cy, cellW, cellH)
+                Catch ex As Exception
+                    Logger.Warn("Bỏ qua part " & entry.PartNumber & ": " & ex.Message)
+                End Try
+
+                partIndex += 1
+            Next
+        Next
+
+        sheetIndex += 1
+    End While
+End Sub
+
+' ----- Thêm 1 cụm view (folded + flat + BOM) cho 1 part vào 1 ô ----------
+Sub AddPartGroup(oSheet As Sheet, entry As PartEntry, cx As Double, cy As Double, _
+                 cellW As Double, cellH As Double)
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim pDoc As PartDocument = entry.PartDoc
+
+    ' Auto-fit scale: nếu part quá lớn so với ô, giảm scale
+    Dim scale As Double = AutoFitScale(pDoc, cellW * 0.4, cellH * 0.4, cfgPartScale)
+
+    ' --- Folded front view (giữa-trái của ô) ---
+    Dim oFolded As DrawingView = oSheet.DrawingViews.AddBaseView( _
+        pDoc, oTG.CreatePoint2d(cx - cellW * 0.25, cy + cellH * 0.05), scale, _
+        ViewOrientationTypeEnum.kFrontViewOrientation, _
+        DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle)
+
+    ' --- Folded side view (chiếu sang phải) ---
+    Try
+        Dim oSide As DrawingView = oSheet.DrawingViews.AddProjectedView( _
+            oFolded, oTG.CreatePoint2d(cx, cy + cellH * 0.05), _
+            DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle)
+    Catch
+    End Try
+
+    ' --- Flat pattern view (góc phải-trên ô) ---
+    If entry.IsSheetMetal Then
+        Try
+            Dim flatOpts As NameValueMap = ThisApplication.TransientObjects.CreateNameValueMap
+            flatOpts.Add("SheetMetalFoldedModel", False)   ' False = flat pattern
+            Dim oFlat As DrawingView = oSheet.DrawingViews.AddBaseView( _
+                pDoc, oTG.CreatePoint2d(cx + cellW * 0.25, cy + cellH * 0.15), scale, _
+                ViewOrientationTypeEnum.kDefaultViewOrientation, _
+                DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle, _
+                "", Nothing, flatOpts)
+        Catch ex As Exception
+            Logger.Warn("Bỏ qua flat pattern " & entry.PartNumber & ": " & ex.Message)
+        End Try
+    End If
+
+    ' --- Detail view cho bend (nếu bật) ---
+    If cfgAddDetailViews AndAlso entry.IsSheetMetal Then
+        Try
+            AddBendDetailView(oSheet, oFolded, cx, cy)
+        Catch ex As Exception
+            Logger.Warn("Bỏ qua detail bend: " & ex.Message)
+        End Try
+    End If
+
+    ' --- Mini BOM riêng cho part này ---
+    AddPartBOM(oSheet, oTG.CreatePoint2d(cx + cellW * 0.05, cy - cellH * 0.30), entry)
+End Sub
+
+Sub AddBendDetailView(oSheet As Sheet, parentView As DrawingView, cx As Double, cy As Double)
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim cx0 As Double = parentView.Position.X
+    Dim cy0 As Double = parentView.Position.Y + parentView.Height / 3
+    Dim centerPt As Point2d = oTG.CreatePoint2d(cx0, cy0)
+    Dim radius As Double = parentView.Height / 8
+    Dim labelPt As Point2d = oTG.CreatePoint2d(cx - 4, cy - 4)
+    Try
+        Dim oDetail As DrawingView = oSheet.DrawingViews.AddDetailView( _
+            parentView, labelPt, _
+            DrawingViewStyleEnum.kHiddenLineRemovedDrawingViewStyle, _
+            cfgDetailScale, centerPt, radius, _
+            DetailViewFenceShapeEnum.kCircularFenceShape, True)
+    Catch
+        ' bỏ qua nếu không tạo được
+    End Try
+End Sub
+
+' ============================================================================
+'                          PARTS LIST / BOM
+' ============================================================================
+Sub AddPartsList(oSheet As Sheet, oView As DrawingView, pos As Point2d, _
+                 partList As List(Of PartEntry))
+    Try
+        Dim oAsm As AssemblyDocument = CType(oView.ReferencedDocumentDescriptor.ReferencedDocument, AssemblyDocument)
+        Dim oBOM As BOM = oAsm.ComponentDefinition.BOM
+        oBOM.StructuredViewEnabled = True
+        oBOM.StructuredViewFirstLevelOnly = True
+
+        Dim oPL As PartsList = oSheet.PartsLists.Add(oView, pos, _
+            PartsListLevelEnum.kStructured, _
+            PartsListNumberingSchemeEnum.kDefaultPartsListNumbering)
+
+        ' Đổi tiêu đề bảng sang tiếng Việt
+        Try
+            oPL.Title = "Danh mục chi tiết"
+        Catch
+        End Try
+
+        ' Xoá các cột không cần, thêm cột vật liệu
+        ConfigurePartsListColumns(oPL)
+    Catch ex As Exception
+        Logger.Warn("Không tạo được BOM tổng: " & ex.Message)
+    End Try
+End Sub
+
+Sub AddPartBOM(oSheet As Sheet, pos As Point2d, entry As PartEntry)
+    ' Tạo 1 bảng note 3 dòng (tiêu đề + header + 1 row) bằng GeneralNote
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim txt As String = _
+        "Danh mục chi tiết" & vbCrLf & _
+        "Mã chi tiết | S.Lượng | Vật liệu" & vbCrLf & _
+        entry.PartNumber & " | " & entry.Quantity & " | " & entry.Material
+    Try
+        Dim oNote As GeneralNote = oSheet.DrawingNotes.GeneralNotes.AddFitted(pos, txt)
+    Catch ex As Exception
+        Logger.Warn("Không tạo được mini-BOM cho " & entry.PartNumber & ": " & ex.Message)
+    End Try
+End Sub
+
+Sub ConfigurePartsListColumns(oPL As PartsList)
+    ' Map các tên cột mong muốn vào PROPERTY ID. Có thể tuỳ chỉnh.
+    '   ITEM           = "{32853F0F-3444-11D1-9E93-0060B03C1CA6} 2"
+    '   QTY            = "{32853F0F-3444-11D1-9E93-0060B03C1CA6} 4"
+    '   PART NUMBER    = "{32853F0F-3444-11D1-9E93-0060B03C1CA6} 5"
+    '   DESCRIPTION    = "{32853F0F-3444-11D1-9E93-0060B03C1CA6} 9"
+    '   MATERIAL       = "{32853F0F-3444-11D1-9E93-0060B03C1CA6} 18"
+
+    ' Đổi tiêu đề các cột tiếng Việt
+    For Each col As PartsListColumn In oPL.PartsListColumns
+        Select Case col.Title.ToUpper()
+            Case "ITEM", "STT"               : col.Title = "Mã chi tiết"
+            Case "PART NUMBER"               : col.Title = "Mã chi tiết"
+            Case "QTY", "QUANTITY"           : col.Title = "S.Lượng"
+            Case "MATERIAL", "VẬT LIỆU"      : col.Title = "Vật liệu"
+            Case "DESCRIPTION"               : col.Title = "Mô tả"
+        End Select
+    Next
+
+    ' Đảm bảo có cột Vật liệu, nếu chưa có thì thêm
+    Dim hasMaterial As Boolean = False
+    For Each col As PartsListColumn In oPL.PartsListColumns
+        If col.Title = "Vật liệu" Then hasMaterial = True : Exit For
+    Next
+    If Not hasMaterial Then
+        Try
+            oPL.PartsListColumns.Add(PropertyTypeEnum.kFilePropertyType, _
+                "{32853F0F-3444-11D1-9E93-0060B03C1CA6}", 18, "Vật liệu")
+        Catch
+        End Try
+    End If
+End Sub
+
+' ============================================================================
+'                       TIỆN ÍCH SHEET / TEXT / PDF
+' ============================================================================
+Sub ConfigureSheet(oSheet As Sheet, name As String, num As Integer, total As Integer)
+    oSheet.Size = cfgSheetSize
+    oSheet.Orientation = If(cfgLandscape, _
+        PageOrientationTypeEnum.kLandscapePageOrientation, _
+        PageOrientationTypeEnum.kPortraitPageOrientation)
+    Try
+        oSheet.Name = name
+    Catch
+    End Try
+End Sub
+
+Sub AddTextBox(oSheet As Sheet, pos As Point2d, text As String)
+    Try
+        Dim oNote As GeneralNote = oSheet.DrawingNotes.GeneralNotes.AddFitted(pos, text)
+        oNote.HorizontalJustification = HorizontalTextAlignmentEnum.kAlignTextLeft
+    Catch ex As Exception
+        Logger.Warn("Không thêm được text box: " & ex.Message)
+    End Try
+End Sub
+
+Function AutoFitScale(pDoc As PartDocument, maxW As Double, maxH As Double, _
+                      preferred As Double) As Double
+    ' Lấy bounding box từ part (đơn vị cm)
+    Try
+        Dim box As Box = pDoc.ComponentDefinition.RangeBox
+        Dim modelW As Double = (box.MaxPoint.X - box.MinPoint.X)
+        Dim modelH As Double = (box.MaxPoint.Y - box.MinPoint.Y)
+        Dim modelD As Double = (box.MaxPoint.Z - box.MinPoint.Z)
+        Dim largest As Double = Math.Max(modelW, Math.Max(modelH, modelD))
+        If largest * preferred > maxW Or largest * preferred > maxH Then
+            Dim s1 As Double = maxW / largest
+            Dim s2 As Double = maxH / largest
+            Return Math.Min(s1, s2) * 0.9
+        End If
+    Catch
+    End Try
+    Return preferred
+End Function
+
+Sub ExportPDF(oDrawing As DrawingDocument, pdfPath As String)
+    Dim oApp As Inventor.Application = ThisApplication
+    Dim oPDFAddIn As TranslatorAddIn = oApp.ApplicationAddIns.ItemById( _
+        "{0AC6FD96-2F4D-42CE-8BE0-8AEA580399E4}")
+
+    Dim oContext As TranslationContext = oApp.TransientObjects.CreateTranslationContext
+    oContext.Type = IOMechanismEnum.kFileBrowseIOMechanism
+
+    Dim oOptions As NameValueMap = oApp.TransientObjects.CreateNameValueMap
+    Dim oDataMedium As DataMedium = oApp.TransientObjects.CreateDataMedium
+
+    If oPDFAddIn.HasSaveCopyAsOptions(oDrawing, oContext, oOptions) Then
+        oOptions.Value("All_Color_AS_Black") = 0
+        oOptions.Value("Remove_Line_Weights") = 0
+        oOptions.Value("Vector_Resolution") = 400
+        oOptions.Value("Sheet_Range") = PrintRangeEnum.kPrintAllSheets
+        oOptions.Value("Custom_Begin_Sheet") = 1
+        oOptions.Value("Custom_End_Sheet") = oDrawing.Sheets.Count
+    End If
+
+    oDataMedium.FileName = pdfPath
+    oPDFAddIn.SaveCopyAs(oDrawing, oContext, oOptions, oDataMedium)
+End Sub
+
+' ============================================================================
+'                            LOGGER (in ra Console)
+' ============================================================================
+Class Logger
+    Shared Sub Info(msg As String)
+        Trace.WriteLine("[iLogic][INFO] " & msg)
+    End Sub
+    Shared Sub Warn(msg As String)
+        Trace.WriteLine("[iLogic][WARN] " & msg)
+    End Sub
+    Shared Sub [Error](msg As String)
+        Trace.WriteLine("[iLogic][ERR ] " & msg)
+    End Sub
+End Class
+
+' ============================================================================
+'                               KHỞI CHẠY
+' ============================================================================
+Main()
